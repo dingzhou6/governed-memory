@@ -1,0 +1,19 @@
+/target/
+/evidence-archives/
+.env
+.DS_Store
+
+# Local host overlay. Keep on disk; do not publish.
+/docs/private/
+
+# Lab notebooks and N4 receipts. Keep on disk; do not publish.
+/docs/research/
+/docs/architecture/agentic-memory-discussion-record.md
+/docs/architecture/agentic-memory-domain-review.md
+/docs/architecture/agentic-memory-execution-guidance.md
+/docs/architecture/agentic-memory-implementation-checklist.md
+/CONTEXT-MAP.md
+/tests/benchmarks/n4_*
+/tests/benchmarks/validate_n4_*
+/tests/fixtures/n4-*
+/.agents/

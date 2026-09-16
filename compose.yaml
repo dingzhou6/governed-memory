@@ -1,0 +1,27 @@
+services:
+  postgres:
+    container_name: agentic-memory-fixture-postgres
+    image: pgvector/pgvector:pg18-trixie@sha256:78bf48b801e792f99e3ac62b5036fd3876e9be48afda16c1e331af1c75ceb2ff
+    labels:
+      com.consultai.fixture: agentic-memory-synthetic-v1
+    environment:
+      POSTGRES_DB: agentic_memory
+      POSTGRES_USER: agentic_memory_migrator
+      POSTGRES_PASSWORD: synthetic-migrator-only
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - agentic-memory-postgres:/var/lib/postgresql
+      - ./migrations:/migrations:ro
+      - ./tests/fixtures:/fixtures:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentic_memory_migrator -d agentic_memory"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  agentic-memory-postgres:
+    name: agentic-memory-fixture-postgres-data
+    labels:
+      com.consultai.fixture: agentic-memory-synthetic-v1
