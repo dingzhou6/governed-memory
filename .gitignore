@@ -17,3 +17,7 @@
 /tests/benchmarks/validate_n4_*
 /tests/fixtures/n4-*
 /.agents/
+/tests/benchmarks/__pycache__/
+/justfile.lab
+/tests/benchmarks/office_retrieval.lab.rs
+/tests/benchmarks/jev_shadow_v1.py.lab
