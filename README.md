@@ -26,4 +26,4 @@ just verify-clean
 
 That command recreates only the dedicated `agentic-memory-fixture` PostgreSQL volume, then runs format, lint, and public-operation tests on synthetic data. It is not a signup or real-data workflow.
 
-See the [engine contract](docs/architecture/agentic-memory-engine-design.md) and [native glossary](docs/memory/CONTEXT.md).
+See the [engine contract](docs/architecture/agentic-memory-engine-design.md), [native glossary](docs/memory/CONTEXT.md), and [TypeSafe adaptation plan](docs/architecture/typesafe-adaptation-plan.md).

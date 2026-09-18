@@ -36,6 +36,675 @@ fn test_database_url(url: &str) -> String {
 }
 
 #[tokio::test]
+#[ignore = "owned empty token-budget test fixture 55456 only"]
+#[allow(clippy::too_many_lines)]
+async fn search_token_budget_is_enforced_locally() {
+    let migrator = PgPoolOptions::new().max_connections(2)
+        .connect("postgres://agentic_memory_migrator:synthetic-migrator-only@127.0.0.1:55456/n4_fixed_long_context_v1")
+        .await.expect("owned token fixture");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tenants")
+        .fetch_one(&migrator)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "reuse only seeded red fixture; never reset");
+    let original: String = sqlx::query_scalar("SELECT content FROM revisions WHERE tenant_id=$1 AND item_id=$2 AND id='50000000000000000000000000000001'")
+        .bind(ALPHA_TENANT).bind(ALLOWED_ITEM).fetch_one(&migrator).await.unwrap();
+    assert_eq!(original, "ALLOWED_ALPHA_HANDBOOK");
+    let runtime = PgPoolOptions::new().max_connections(2)
+        .connect("postgres://agentic_memory_runtime:synthetic-runtime-only@127.0.0.1:55456/n4_fixed_long_context_v1")
+        .await.expect("restricted token runtime");
+    let reader = random_bearer();
+    let updated=sqlx::query("UPDATE credentials SET token_digest=$1, revoked_at=NULL, expires_at=clock_timestamp()+interval '24 hours' WHERE tenant_id=$2 AND id=$3 AND credential_class='agent_reader'")
+        .bind(Sha256::digest(reader.as_bytes()).as_slice()).bind(ALPHA_TENANT).bind(ALICE_CREDENTIAL)
+        .execute(&migrator).await.unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    let app = router(runtime);
+    let core = tiktoken_rs::o200k_base().unwrap();
+    let request = |query: &str, limit: u16| {
+        serde_json::json!({"query":query,"context_token_budget":{"tokenizer":"o200k_base:tiktoken-rs-0.12.0","max_tokens":limit}}).to_string()
+    };
+    let check = |body: &Value, limit: u16| {
+        let text = body["context"]["text"].as_str().unwrap();
+        let count = core
+            .encode(text, &std::collections::HashSet::new())
+            .unwrap()
+            .0
+            .len();
+        assert_eq!(body["context"]["token_count"], count);
+        assert!(count <= usize::from(limit));
+        let evidence: Value = serde_json::from_str(text).unwrap();
+        let expected=body["items"].as_array().unwrap().iter().map(|item| serde_json::json!({"item_id":item["item_id"],"revision_id":item["revision_id"],"text":item["excerpt"],"citation":item.get("citation").unwrap_or(&Value::Null)})).collect::<Vec<_>>();
+        assert_eq!(evidence, serde_json::json!({"evidence":expected}));
+    };
+    let result = search(
+        &app,
+        Some(&reader),
+        request("ALLOWED_ALPHA_HANDBOOK", 128).as_bytes(),
+    )
+    .await;
+    assert_eq!(result.0, StatusCode::OK);
+    check(&result.1, 128);
+    let plain = search(
+        &app,
+        Some(&reader),
+        br#"{"query":"ALLOWED_ALPHA_HANDBOOK"}"#,
+    )
+    .await;
+    assert!(plain.1.get("context").is_none());
+    for query in ["FORBIDDEN_BOB_PRIVATE", "FORBIDDEN_BETA_COMPANY"] {
+        let response = search(&app, Some(&reader), request(query, 1024).as_bytes()).await;
+        assert_eq!(response.0, StatusCode::OK);
+        check(&response.1, 1024);
+        assert!(
+            response.1["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["item_id"] != BOB_PRIVATE_ITEM && item["item_id"] != FOREIGN_ITEM)
+        );
+    }
+    let contents = vec![
+        format!("TOKENWHOLEV4 English {}", "word ".repeat(140)),
+        format!("TOKENWHOLEV4 中文 {}", "中文".repeat(140)),
+        format!(
+            "TOKENWHOLEV4 mixed {} <|endoftext|>",
+            "English中文 ".repeat(70)
+        ),
+    ];
+    seed_search_item_revisions(
+        &migrator,
+        "30000000000000000000000000000001",
+        "token-whole-item-v4",
+        &["token-whole-r4"],
+    )
+    .await;
+    activate_search_extraction(
+        &migrator,
+        "token-whole-item-v4",
+        "token-whole-r4",
+        "token-whole-source-v4",
+        &Sha256::digest(b"token-whole-source-v4"),
+        "token-whole-set-v4",
+        &contents,
+    )
+    .await;
+    let full = search(
+        &app,
+        Some(&reader),
+        request("TOKENWHOLEV4", 4096).as_bytes(),
+    )
+    .await;
+    assert_eq!(full.0, StatusCode::OK);
+    check(&full.1, 4096);
+    let returned = full.1["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["excerpt"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(returned, contents.iter().map(String::as_str).collect());
+    let small = search(&app, Some(&reader), request("TOKENWHOLEV4", 128).as_bytes()).await;
+    assert_eq!(small.0, StatusCode::OK);
+    check(&small.1, 128);
+    assert!(small.1["items"].as_array().unwrap().len() < 3);
+    assert_eq!(small.1["truncated"], true);
+    // Four earlier token-rejected spans cannot consume the source's four credits.
+    let mut credit_contents = (0..4)
+        .map(|_| format!("{} {}", "TOKENCREDITV4 ".repeat(20), "中".repeat(400)))
+        .collect::<Vec<_>>();
+    credit_contents.push("TOKENCREDITV4 small complete span".into());
+    seed_search_item_revisions(
+        &migrator,
+        "30000000000000000000000000000001",
+        "token-credit-item-v4",
+        &["token-credit-r4"],
+    )
+    .await;
+    activate_search_extraction(
+        &migrator,
+        "token-credit-item-v4",
+        "token-credit-r4",
+        "token-credit-source-v4",
+        &Sha256::digest(b"token-credit-source-v4"),
+        "token-credit-set-v4",
+        &credit_contents,
+    )
+    .await;
+    let control = search(
+        &app,
+        Some(&reader),
+        br#"{"query":"TOKENCREDITV4","max_context_bytes":16384}"#,
+    )
+    .await;
+    assert_eq!(control.0, StatusCode::OK);
+    assert_eq!(control.1["items"].as_array().unwrap().len(), 4);
+    assert!(
+        control.1["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["excerpt"].as_str().unwrap().len() > 1000)
+    );
+    let token = search(
+        &app,
+        Some(&reader),
+        request("TOKENCREDITV4", 220).as_bytes(),
+    )
+    .await;
+    assert_eq!(token.0, StatusCode::OK);
+    check(&token.1, 220);
+    assert_eq!(token.1["items"].as_array().unwrap().len(), 1);
+    assert_eq!(token.1["items"][0]["excerpt"], credit_contents[4]);
+    // Manual records also remain whole only in the opt-in path.
+    let manual = format!("TOKENMANUALV4 {}", "English中文 ".repeat(80));
+    let mut seed = migrator.begin().await.unwrap();
+    sqlx::query("INSERT INTO items (tenant_id,id,collection_id) VALUES ($1,'token-manual-item-v4','30000000000000000000000000000001')").bind(ALPHA_TENANT).execute(&mut *seed).await.unwrap();
+    sqlx::query("INSERT INTO revisions (tenant_id,item_id,id,content) VALUES ($1,'token-manual-item-v4','token-manual-r4',$2)").bind(ALPHA_TENANT).bind(&manual).execute(&mut *seed).await.unwrap();
+    sqlx::query("UPDATE items SET active_revision_id='token-manual-r4' WHERE tenant_id=$1 AND id='token-manual-item-v4'").bind(ALPHA_TENANT).execute(&mut *seed).await.unwrap();
+    sqlx::query(
+        "INSERT INTO lexical_representations (tenant_id,item_id,revision_id,document)
+         VALUES ($1,'token-manual-item-v4','token-manual-r4',to_tsvector('simple',$2))",
+    )
+    .bind(ALPHA_TENANT)
+    .bind(&manual)
+    .execute(&mut *seed)
+    .await
+    .unwrap();
+    seed.commit().await.unwrap();
+    let whole = search(
+        &app,
+        Some(&reader),
+        request("TOKENMANUALV4", 4096).as_bytes(),
+    )
+    .await;
+    assert_eq!(whole.0, StatusCode::OK);
+    check(&whole.1, 4096);
+    assert_eq!(whole.1["items"][0]["excerpt"], manual);
+    let legacy = search(&app, Some(&reader), br#"{"query":"TOKENMANUALV4"}"#).await;
+    assert!(legacy.1["items"][0]["excerpt"].as_str().unwrap().len() <= 512);
+    // A replacement extraction is authoritative; tokenization cannot restore old spans.
+    activate_search_extraction(
+        &migrator,
+        "token-whole-item-v4",
+        "token-whole-r4",
+        "token-whole-source-v4",
+        &Sha256::digest(b"token-whole-source-v4"),
+        "token-new-set-v4",
+        &["TOKENCURRENTV4 new supported passage".into()],
+    )
+    .await;
+    let stale = search(
+        &app,
+        Some(&reader),
+        request("TOKENWHOLEV4", 4096).as_bytes(),
+    )
+    .await;
+    assert_eq!(stale.0, StatusCode::OK);
+    assert!(stale.1["items"].as_array().unwrap().is_empty());
+    let current = search(
+        &app,
+        Some(&reader),
+        request("TOKENCURRENTV4", 4096).as_bytes(),
+    )
+    .await;
+    assert_eq!(current.0, StatusCode::OK);
+    check(&current.1, 4096);
+    assert_eq!(
+        current.1["items"][0]["citation"]["extraction_set_id"],
+        "token-new-set-v4"
+    );
+    for (value, code) in [
+        (
+            serde_json::json!({"tokenizer":"other","max_tokens":128}),
+            "unsupported_context_tokenizer",
+        ),
+        (
+            serde_json::json!({"tokenizer":"o200k_base:tiktoken-rs-0.12.0","max_tokens":0}),
+            "invalid_context_budget",
+        ),
+        (
+            serde_json::json!({"tokenizer":"o200k_base:tiktoken-rs-0.12.0","max_tokens":1}),
+            "invalid_context_budget",
+        ),
+        (Value::Null, "malformed"),
+        (
+            serde_json::json!({"tokenizer":"o200k_base:tiktoken-rs-0.12.0","max_tokens":65536}),
+            "malformed",
+        ),
+    ] {
+        let body = serde_json::json!({"query":"q","context_token_budget":value}).to_string();
+        let bad = search(&app, Some(&reader), body.as_bytes()).await;
+        assert_eq!(bad.0, StatusCode::BAD_REQUEST);
+        assert_eq!(bad.1["code"], code);
+        assert_eq!(
+            search(&app, None, body.as_bytes()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    sqlx::query("UPDATE credentials SET revoked_at=now() WHERE tenant_id=$1 AND id=$2")
+        .bind(ALPHA_TENANT)
+        .bind(ALICE_CREDENTIAL)
+        .execute(&migrator)
+        .await
+        .unwrap();
+    assert_eq!(
+        search(
+            &app,
+            Some(&reader),
+            request("TOKENWHOLEV4", 4096).as_bytes()
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+#[ignore = "owned empty token-primary test fixture 55458 only"]
+#[allow(clippy::too_many_lines)]
+async fn search_token_primary_omitted_bytes_uses_operator_max() {
+    let migrator = PgPoolOptions::new()
+        .max_connections(2)
+        .connect("postgres://agentic_memory_migrator:synthetic-migrator-only@127.0.0.1:55458/n4_fixed_long_context_v1")
+        .await
+        .expect("owned token-primary fixture");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tenants")
+        .fetch_one(&migrator)
+        .await
+        .unwrap();
+    let reader = random_bearer();
+    if count == 0 {
+        let mut transaction = migrator.begin().await.expect("seed token-primary fixture");
+        sqlx::raw_sql(include_str!("fixtures/reset.sql"))
+            .execute(&mut *transaction)
+            .await
+            .expect("initialize empty 55458");
+        insert_reader(
+            &mut transaction,
+            ALICE_CREDENTIAL,
+            "10000000000000000000000000000001",
+            &reader,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO lexical_representations (tenant_id,item_id,revision_id,document)
+             SELECT tenant_id,item_id,id,to_tsvector('simple',content) FROM revisions",
+        )
+        .execute(&mut *transaction)
+        .await
+        .expect("index seeded revisions");
+        transaction.commit().await.expect("commit 55458 seed");
+    } else {
+        assert_eq!(count, 2, "reuse only seeded 55458; never reset");
+        let updated = sqlx::query("UPDATE credentials SET token_digest=$1, revoked_at=NULL, expires_at=clock_timestamp()+interval '24 hours' WHERE tenant_id=$2 AND id=$3 AND credential_class='agent_reader'")
+            .bind(Sha256::digest(reader.as_bytes()).as_slice())
+            .bind(ALPHA_TENANT)
+            .bind(ALICE_CREDENTIAL)
+            .execute(&migrator)
+            .await
+            .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+    }
+    let runtime = PgPoolOptions::new()
+        .max_connections(2)
+        .connect("postgres://agentic_memory_runtime:synthetic-runtime-only@127.0.0.1:55458/n4_fixed_long_context_v1")
+        .await
+        .expect("restricted token-primary runtime");
+    let app = router(runtime);
+    let contents = (0..4)
+        .map(|i| format!("TOKENPRIMARY {i} {}", "block ".repeat(500)))
+        .collect::<Vec<_>>();
+    assert!(contents.iter().map(String::len).sum::<usize>() > 8192);
+    assert!(contents.iter().map(String::len).sum::<usize>() < 16384);
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM items WHERE tenant_id=$1 AND id='token-primary-item-v2')",
+    )
+    .bind(ALPHA_TENANT)
+    .fetch_one(&migrator)
+    .await
+    .unwrap();
+    if !exists {
+        seed_search_item_revisions(
+            &migrator,
+            "30000000000000000000000000000001",
+            "token-primary-item-v2",
+            &["token-primary-r2"],
+        )
+        .await;
+        activate_search_extraction(
+            &migrator,
+            "token-primary-item-v2",
+            "token-primary-r2",
+            "token-primary-source-v2",
+            &Sha256::digest(b"token-primary-source-v2"),
+            "token-primary-set-v2",
+            &contents,
+        )
+        .await;
+    }
+    let core = tiktoken_rs::o200k_base().unwrap();
+    let omitted = search(
+        &app,
+        Some(&reader),
+        br#"{"query":"TOKENPRIMARY","context_token_budget":{"tokenizer":"o200k_base:tiktoken-rs-0.12.0","max_tokens":8192}}"#,
+    )
+    .await;
+    assert_eq!(omitted.0, StatusCode::OK);
+    let omitted_bytes = omitted.1["context_bytes"].as_u64().unwrap();
+    let text = omitted.1["context"]["text"].as_str().unwrap();
+    let count = core
+        .encode(text, &std::collections::HashSet::new())
+        .unwrap()
+        .0
+        .len();
+    assert_eq!(omitted.1["context"]["token_count"], count);
+    assert!(count <= 8192);
+    assert!(
+        omitted_bytes > 8192,
+        "token-primary omitted bytes should use operator max, not 8KB; context_bytes={} items={}",
+        omitted_bytes,
+        omitted.1["items"].as_array().map_or(0, Vec::len)
+    );
+    assert!(omitted_bytes <= 16384);
+    assert_eq!(omitted.1["items"].as_array().unwrap().len(), 4);
+    let dual = search(
+        &app,
+        Some(&reader),
+        br#"{"query":"TOKENPRIMARY","max_context_bytes":8192,"context_token_budget":{"tokenizer":"o200k_base:tiktoken-rs-0.12.0","max_tokens":8192}}"#,
+    )
+    .await;
+    assert_eq!(dual.0, StatusCode::OK);
+    assert!(dual.1["context_bytes"].as_u64().unwrap() <= 8192);
+    assert!(dual.1["items"].as_array().unwrap().len() < 4);
+    let byte_only = search(&app, Some(&reader), br#"{"query":"TOKENPRIMARY"}"#).await;
+    assert_eq!(byte_only.0, StatusCode::OK);
+    assert!(byte_only.1.get("context").is_none());
+    assert!(byte_only.1["context_bytes"].as_u64().unwrap() <= 8192);
+    for query in ["FORBIDDEN_BOB_PRIVATE", "FORBIDDEN_BETA_COMPANY"] {
+        let body = serde_json::json!({"query":query,"context_token_budget":{"tokenizer":"o200k_base:tiktoken-rs-0.12.0","max_tokens":1024}}).to_string();
+        let response = search(&app, Some(&reader), body.as_bytes()).await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert!(
+            response.1["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["item_id"] != BOB_PRIVATE_ITEM && item["item_id"] != FOREIGN_ITEM)
+        );
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn search_clause_union_recovers_and_blocked_distinctive_spans() {
+    let (migrator, runtime, _purge, alice, _bob, _writer) = setup().await;
+    seed_search_item_revisions(
+        &migrator,
+        "30000000000000000000000000000001",
+        "clause-en-item",
+        &["clause-en-r1"],
+    )
+    .await;
+    let en_target =
+        "Current sample-bottle plan: use one 0.75-litre bottle at each shoreline station."
+            .to_string();
+    let en_decoy =
+        "April briefing for people who have only seen the Rowan booking messages.".to_string();
+    activate_search_extraction(
+        &migrator,
+        "clause-en-item",
+        "clause-en-r1",
+        "clause-en-source",
+        &Sha256::digest(b"clause-en-source"),
+        "clause-en-set",
+        &[en_decoy.clone(), en_target.clone()],
+    )
+    .await;
+    seed_search_item_revisions(
+        &migrator,
+        "30000000000000000000000000000001",
+        "clause-zh-item",
+        &["clause-zh-r1"],
+    )
+    .await;
+    let zh_target = "C4包包含逐句字幕主文件、预录字幕备用文件和一份版本核对表。".to_string();
+    let zh_decoy = "石桥厅旧海报草稿与仓库群里的两家剧社消息。".to_string();
+    activate_search_extraction(
+        &migrator,
+        "clause-zh-item",
+        "clause-zh-r1",
+        "clause-zh-source",
+        &Sha256::digest(b"clause-zh-source"),
+        "clause-zh-set",
+        &[zh_decoy.clone(), zh_target.clone()],
+    )
+    .await;
+
+    let en_question = concat!(
+        "I'm preparing the briefing for people who have only seen the April plan or the shared Rowan booking messages. ",
+        "Also state the current sample-bottle plan, including duplicates."
+    );
+    let zh_question = concat!(
+        "我手上有石桥厅旧海报草稿、仓库群里的两家剧社消息。",
+        "当前应使用哪套简体中文字幕。"
+    );
+
+    let mut transaction = runtime.begin().await.expect("begin clause-union search");
+    sqlx::query_scalar::<_, String>(
+        "SELECT set_config('app.credential_digest', encode($1::bytea, 'hex'), true)",
+    )
+    .bind(Sha256::digest(alice.as_bytes()).as_slice())
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("set clause-union digest");
+    set_local(&mut transaction, "app.operation", "search").await;
+    set_local(&mut transaction, "app.tenant_id", ALPHA_TENANT).await;
+
+    let v1_en =
+        sqlx::query("SELECT passage_id, content FROM search_current_memories($1,$2,$3,$4,$5,$6)")
+            .bind(ALPHA_TENANT)
+            .bind(ALICE_CREDENTIAL)
+            .bind("00000000-0000-0000-0000-000000000801")
+            .bind(en_question)
+            .bind(4096_i32)
+            .bind(Option::<Vec<String>>::None)
+            .fetch_all(&mut *transaction)
+            .await
+            .expect("bounded v1 english search");
+    assert!(
+        v1_en
+            .iter()
+            .all(|row| row.get::<String, _>("content") != en_target),
+        "full-question AND must not retrieve the distinctive sample-bottle span"
+    );
+
+    let union_en = sqlx::query(
+        "SELECT passage_id, content FROM search_current_memories_clause_union_v1($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(ALPHA_TENANT)
+    .bind(ALICE_CREDENTIAL)
+    .bind("00000000-0000-0000-0000-000000000802")
+    .bind(en_question)
+    .bind(4096_i32)
+    .bind(Option::<Vec<String>>::None)
+    .fetch_all(&mut *transaction)
+    .await
+    .expect("clause-union english search");
+    assert!(
+        union_en
+            .iter()
+            .any(|row| row.get::<String, _>("content") == en_target),
+        "clause-union must recover the sample-bottle span"
+    );
+
+    let v1_zh =
+        sqlx::query("SELECT passage_id, content FROM search_current_memories($1,$2,$3,$4,$5,$6)")
+            .bind(ALPHA_TENANT)
+            .bind(ALICE_CREDENTIAL)
+            .bind("00000000-0000-0000-0000-000000000803")
+            .bind(zh_question)
+            .bind(4096_i32)
+            .bind(Option::<Vec<String>>::None)
+            .fetch_all(&mut *transaction)
+            .await
+            .expect("bounded v1 chinese search");
+    assert!(
+        v1_zh
+            .iter()
+            .all(|row| row.get::<String, _>("content") != zh_target),
+        "clause-string AND must not retrieve the C4 subtitle span"
+    );
+
+    let union_zh = sqlx::query(
+        "SELECT passage_id, content FROM search_current_memories_clause_union_v1($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(ALPHA_TENANT)
+    .bind(ALICE_CREDENTIAL)
+    .bind("00000000-0000-0000-0000-000000000804")
+    .bind(zh_question)
+    .bind(4096_i32)
+    .bind(Option::<Vec<String>>::None)
+    .fetch_all(&mut *transaction)
+    .await
+    .expect("clause-union chinese search");
+    assert!(
+        union_zh
+            .iter()
+            .any(|row| row.get::<String, _>("content") == zh_target),
+        "han-bigram clause-union must recover the C4 subtitle span"
+    );
+
+    transaction
+        .commit()
+        .await
+        .expect("commit clause-union searches");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn search_clause_union_recovers_han_comma_split_subtitle_span() {
+    let (migrator, runtime, _purge, alice, _bob, _writer) = setup().await;
+    seed_search_item_revisions(
+        &migrator,
+        "30000000000000000000000000000001",
+        "clause-zh-comma-item",
+        &["clause-zh-comma-r1"],
+    )
+    .await;
+    let zh_target = "C4包包含逐句字幕主文件、预录字幕备用文件和一份版本核对表。".to_string();
+    let zh_decoys = [
+        "石桥厅旧海报草稿仍贴在仓库墙上，剧社巡演简报也放在导演桌上。",
+        "仓库群里的两家剧社消息写进巡演简报，导演核对旧海报草稿。",
+        "巡演简报和导演备注放在仓库，剧社海报草稿尚未回收。",
+        "旧海报草稿、剧社消息和仓库巡演简报由导演汇总。",
+        "导演把石桥厅海报草稿和仓库剧社巡演简报一起归档。",
+        "两家剧社在仓库传阅海报草稿和巡演简报，导演未改场次。",
+        "海报、剧社、仓库、巡演、简报、导演六项仍按旧稿执行。",
+        "石桥厅仓库剧社海报巡演简报导演备注的合订本。",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let mut zh_contents = zh_decoys;
+    zh_contents.push(zh_target.clone());
+    activate_search_extraction(
+        &migrator,
+        "clause-zh-comma-item",
+        "clause-zh-comma-r1",
+        "clause-zh-comma-source",
+        &Sha256::digest(b"clause-zh-comma-source"),
+        "clause-zh-comma-set",
+        &zh_contents,
+    )
+    .await;
+
+    let zh_question = concat!(
+        "我手上有石桥厅旧海报草稿、仓库群里的两家剧社消息，",
+        "还有巡演简报和导演备注，",
+        "当前应使用哪套简体中文字幕。"
+    );
+    let subtitle_at = zh_question
+        .find("字幕")
+        .expect("zh-q1-shaped question includes the subtitle ask");
+    assert!(
+        !zh_question[..subtitle_at].contains('。'),
+        "the subtitle ask must sit in a later comma clause with no period before it"
+    );
+    assert_eq!(zh_question.matches('。').count(), 1);
+    assert!(zh_question.ends_with('。'));
+
+    let clause_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM lexical_clause_queries_v1($1)")
+            .bind(zh_question)
+            .fetch_one(&migrator)
+            .await
+            .expect("migrator may inspect clause split; runtime cannot");
+    assert_eq!(
+        clause_count, 4,
+        "ideographic and enumeration commas must yield four Han clauses"
+    );
+    let two_char: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM lexical_clause_queries_v1(E'甲乙，丙丁。')")
+            .fetch_one(&migrator)
+            .await
+            .expect("migrator two-character comma split");
+    assert_eq!(two_char, 2, "comma split must emit two Han bigram clauses");
+
+    let mut transaction = runtime.begin().await.expect("begin han-comma search");
+    sqlx::query_scalar::<_, String>(
+        "SELECT set_config('app.credential_digest', encode($1::bytea, 'hex'), true)",
+    )
+    .bind(Sha256::digest(alice.as_bytes()).as_slice())
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("set han-comma digest");
+    set_local(&mut transaction, "app.operation", "search").await;
+    set_local(&mut transaction, "app.tenant_id", ALPHA_TENANT).await;
+
+    let v1_zh =
+        sqlx::query("SELECT passage_id, content FROM search_current_memories($1,$2,$3,$4,$5,$6)")
+            .bind(ALPHA_TENANT)
+            .bind(ALICE_CREDENTIAL)
+            .bind("00000000-0000-0000-0000-000000000811")
+            .bind(zh_question)
+            .bind(4096_i32)
+            .bind(Option::<Vec<String>>::None)
+            .fetch_all(&mut *transaction)
+            .await
+            .expect("bounded v1 han-comma search");
+    assert!(
+        v1_zh
+            .iter()
+            .all(|row| row.get::<String, _>("content") != zh_target),
+        "v1 AND must not retrieve the C4 subtitle span from a comma-joined Han question"
+    );
+
+    let union_zh = sqlx::query(
+        "SELECT passage_id, content FROM search_current_memories_clause_union_v1($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(ALPHA_TENANT)
+    .bind(ALICE_CREDENTIAL)
+    .bind("00000000-0000-0000-0000-000000000812")
+    .bind(zh_question)
+    .bind(4096_i32)
+    .bind(Option::<Vec<String>>::None)
+    .fetch_all(&mut *transaction)
+    .await
+    .expect("clause-union han-comma search");
+    assert!(
+        union_zh
+            .iter()
+            .any(|row| row.get::<String, _>("content") == zh_target),
+        "comma-split Han clause-union must recover the C4 subtitle span inside local k=4"
+    );
+
+    transaction
+        .commit()
+        .await
+        .expect("commit han-comma searches");
+}
+
+#[tokio::test]
 #[ignore = "requires exclusively owned budget test fixture on port 55454"]
 #[allow(clippy::too_many_lines)] // One isolated public contract, preserving the red fixture.
 async fn search_context_budget_accepts_explicit_eight_kib() {
@@ -9916,6 +10585,9 @@ async fn assert_runtime_role(pool: &PgPool) {
                   AND NOT has_function_privilege(current_user, 'record_read_audit(text,text,text)', 'EXECUTE')
                   AND has_function_privilege(current_user, 'read_current_item(text,text,text,text,text,text[])', 'EXECUTE')
                   AND has_function_privilege(current_user, 'search_current_memories(text,text,text,text,integer,text[])', 'EXECUTE')
+                  AND has_function_privilege(current_user, 'search_current_memories_clause_union_v1(text,text,text,text,integer,text[])', 'EXECUTE')
+                  AND NOT has_function_privilege(current_user, 'lexical_clause_queries_v1(text)', 'EXECUTE')
+                  AND NOT has_function_privilege(current_user, 'han_bigram_document_v1(text)', 'EXECUTE')
                   AND has_function_privilege(current_user, 'list_current_resources(text,text,text,text,integer,text)', 'EXECUTE')
                   AND has_function_privilege(current_user, 'create_private_memory(text,text,text,bytea,bytea,text,text[],text,text)', 'EXECUTE')
                   AND has_function_privilege(current_user, 'correct_private_memory(text,text,text,bytea,bytea,text,text,text,text[],text,text)', 'EXECUTE')

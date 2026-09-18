@@ -1,6 +1,7 @@
 #[cfg(feature = "benchmark-trace")]
 #[doc(hidden)]
 pub mod benchmark_trace;
+mod context_tokens;
 
 use axum::{
     Extension, Json, Router,
@@ -262,7 +263,10 @@ async fn search_memories(
         &semantic,
     )
     .await;
-    let result = if first.is_err() && matches!(semantic, SemanticPlan::Ready { .. }) {
+    let result = if first.as_ref().is_err_and(|error| {
+        error.permits_semantic_fallback(prepared.input.context_token_budget.is_some())
+    }) && matches!(semantic, SemanticPlan::Ready { .. })
+    {
         search_memories_in_database(
             &pool,
             &prepared.digest,
@@ -353,9 +357,7 @@ async fn prepare_search(
     let mut input: SearchInput = serde_json::from_slice(&body).map_err(|source| {
         RequestRejection::attributed(RequestFailure::JsonBody { source }, digest.clone())
     })?;
-    input
-        .max_context_bytes
-        .get_or_insert(limits.default_context_bytes);
+    input.max_context_bytes = Some(default_search_context_bytes(&input, limits));
     validate_search_input_with_limits(&input, limits)
         .map_err(|error| RequestRejection::attributed(error, digest.clone()))?;
     Ok(PreparedSearch {
@@ -363,6 +365,16 @@ async fn prepare_search(
         reader,
         input,
     })
+}
+
+fn default_search_context_bytes(input: &SearchInput, limits: SearchLimits) -> u16 {
+    input
+        .max_context_bytes
+        .unwrap_or(if input.context_token_budget.is_some() {
+            limits.max_context_bytes
+        } else {
+            limits.default_context_bytes
+        })
 }
 
 #[cfg(test)]
@@ -374,6 +386,9 @@ fn validate_search_input_with_limits(
     input: &SearchInput,
     limits: SearchLimits,
 ) -> Result<(), RequestFailure> {
+    if let Some(allowance) = &input.context_token_budget {
+        allowance.validate()?;
+    }
     if !(1..=4096).contains(&input.query.len())
         || input.query.trim().is_empty()
         || input.query.contains('\0')
@@ -544,7 +559,16 @@ async fn search_memories_in_database(
     }
     let no_candidates = rows.is_empty();
     let semantic_status = effective_semantic.status();
-    let (items, context_bytes, truncated) = pack_search_rows(&rows, input, semantic_status)?;
+    let bytes = input.max_context_bytes.expect("prepared search budget");
+    let (items, context_bytes, truncated, context) =
+        if let Some(allowance) = &input.context_token_budget {
+            let (items, used, truncated, context) =
+                context_tokens::pack(rows, bytes, semantic_status, allowance.clone()).await?;
+            (items, used, truncated, Some(context))
+        } else {
+            let (items, used, truncated) = pack_search_rows(&rows, bytes, semantic_status, None)?;
+            (items, used, truncated, None)
+        };
     let mut warnings = effective_semantic.diagnostics(no_candidates);
     if input.query_mode != QueryMode::BoundedV1 {
         let status: String =
@@ -571,6 +595,7 @@ async fn search_memories_in_database(
         context_bytes,
         truncated,
         warnings,
+        context,
     })
 }
 
@@ -745,8 +770,9 @@ fn sanitized_semantic_diagnostic(value: &str) -> &'static str {
 #[allow(clippy::too_many_lines)] // Keep opt-in observations beside the unchanged admission branches.
 fn pack_search_rows(
     rows: &[PgRow],
-    input: &SearchInput,
+    max_context_bytes: u16,
     semantic_status: &'static str,
+    mut tokens: Option<&mut context_tokens::Work>,
 ) -> Result<(Vec<SearchItem>, usize, bool), RequestFailure> {
     let candidate_omitted = rows
         .first()
@@ -754,9 +780,7 @@ fn pack_search_rows(
         .transpose()
         .map_err(RequestFailure::storage)?
         .unwrap_or(false);
-    let mut budget = ExcerptBudget::new(usize::from(
-        input.max_context_bytes.expect("prepared search budget"),
-    ));
+    let mut budget = ExcerptBudget::new(usize::from(max_context_bytes));
     let mut items = Vec::with_capacity(rows.len().min(12));
     let mut source_contributions = HashMap::new();
     let mut accepted_passages = HashSet::new();
@@ -836,7 +860,9 @@ fn pack_search_rows(
             source_contribution_omitted = true;
             continue;
         }
-        let Some(item) = search_item_row(row, &mut budget, semantic_status)? else {
+        let remaining_before = budget.remaining;
+        let Some(item) = search_item_row(row, &mut budget, semantic_status, tokens.is_some())?
+        else {
             #[cfg(feature = "benchmark-trace")]
             benchmark_trace::row(row, ordinal, "byte_budget", budget.remaining, items.len());
             if budget.remaining > 0 {
@@ -852,6 +878,15 @@ fn pack_search_rows(
             );
             break;
         };
+        if let Some(work) = tokens.as_deref_mut()
+            && !work.admit(&items, &item)?
+        {
+            budget.remaining = remaining_before;
+            budget.truncated = true;
+            #[cfg(feature = "benchmark-trace")]
+            benchmark_trace::row(row, ordinal, "token_budget", budget.remaining, items.len());
+            continue;
+        }
         if let Some(key) = source_key {
             *source_contributions.entry(key).or_insert(0) += 1;
         }
@@ -869,8 +904,7 @@ fn pack_search_rows(
         || source_contribution_omitted
         || budget.truncated
         || rows.len() > items.len();
-    let context_bytes =
-        usize::from(input.max_context_bytes.expect("prepared search budget")) - budget.remaining;
+    let context_bytes = usize::from(max_context_bytes) - budget.remaining;
     Ok((items, context_bytes, truncated))
 }
 
@@ -995,6 +1029,7 @@ fn search_item_row(
     row: &PgRow,
     budget: &mut ExcerptBudget,
     semantic_status: &'static str,
+    whole_only: bool,
 ) -> Result<Option<SearchItem>, RequestFailure> {
     let content: String = row.try_get("content").map_err(RequestFailure::storage)?;
     let hit_kind: String = row.try_get("hit_kind").map_err(RequestFailure::storage)?;
@@ -1002,7 +1037,7 @@ fn search_item_row(
         hit_kind.as_str(),
         "passage" | "semantic_passage" | "adjacent_continuation"
     );
-    let Some(excerpt) = (if passage_hit {
+    let Some(excerpt) = (if passage_hit || whole_only {
         budget.take_whole(&content)
     } else {
         budget.take(&content)
@@ -2501,6 +2536,8 @@ struct SearchInput {
     scope: OptionalSearchScope,
     #[serde(default, deserialize_with = "present_context_bytes")]
     max_context_bytes: Option<u16>,
+    #[serde(default, deserialize_with = "context_tokens::present")]
+    context_token_budget: Option<context_tokens::Allowance>,
     #[serde(default)]
     time_mode: TimeMode,
 }
@@ -2581,6 +2618,8 @@ struct SearchResponse {
     context_bytes: usize,
     truncated: bool,
     warnings: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<context_tokens::Context>,
 }
 
 #[derive(Clone)]
@@ -2802,6 +2841,12 @@ struct ForgetMemory {
 
 #[derive(Debug, Error)]
 enum RequestFailure {
+    #[error("context budget unavailable")]
+    ContextBudgetUnavailable,
+    #[error("unsupported context tokenizer")]
+    UnsupportedContextTokenizer,
+    #[error("invalid context budget")]
+    InvalidContextBudget,
     #[error("malformed request")]
     Malformed,
     #[error("authentication required")]
@@ -2868,13 +2913,26 @@ enum RequestFailure {
 }
 
 impl RequestFailure {
+    const fn permits_semantic_fallback(&self, token_mode: bool) -> bool {
+        !token_mode
+            && !matches!(
+                self,
+                Self::ContextBudgetUnavailable
+                    | Self::InvalidContextBudget
+                    | Self::UnsupportedContextTokenizer
+            )
+    }
+
     fn storage(source: sqlx::Error) -> Self {
         Self::Storage { source }
     }
 
     fn rejection_outcome(&self) -> Option<&'static str> {
         match self {
-            Self::Malformed
+            Self::ContextBudgetUnavailable => Some("unavailable"),
+            Self::UnsupportedContextTokenizer
+            | Self::InvalidContextBudget
+            | Self::Malformed
             | Self::DatabaseInputRejected { .. }
             | Self::BodyTimeout { .. }
             | Self::BodyRead { .. }
@@ -2892,6 +2950,14 @@ impl RequestFailure {
 
     fn response(&self, request_id: String) -> Response {
         let (http_status, code) = match self {
+            Self::ContextBudgetUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "context_budget_unavailable",
+            ),
+            Self::UnsupportedContextTokenizer => {
+                (StatusCode::BAD_REQUEST, "unsupported_context_tokenizer")
+            }
+            Self::InvalidContextBudget => (StatusCode::BAD_REQUEST, "invalid_context_budget"),
             Self::Malformed
             | Self::DatabaseInputRejected { .. }
             | Self::BodyTimeout { .. }
@@ -3173,6 +3239,33 @@ mod search_limit_contract_tests {
     }
 
     #[test]
+    fn omitted_token_budget_defaults_to_operator_max_bytes() {
+        let limits = SearchLimits::default();
+        let omitted_bytes: SearchInput = serde_json::from_str(r#"{"query":"q"}"#).unwrap();
+        assert_eq!(default_search_context_bytes(&omitted_bytes, limits), 8192);
+        let omitted_token: SearchInput = serde_json::from_value(serde_json::json!({
+            "query":"q",
+            "context_token_budget":{
+                "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+                "max_tokens":128
+            }
+        }))
+        .unwrap();
+        assert!(omitted_token.max_context_bytes.is_none());
+        assert_eq!(default_search_context_bytes(&omitted_token, limits), 16384);
+        let explicit: SearchInput = serde_json::from_value(serde_json::json!({
+            "query":"q",
+            "max_context_bytes":8192,
+            "context_token_budget":{
+                "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+                "max_tokens":128
+            }
+        }))
+        .unwrap();
+        assert_eq!(default_search_context_bytes(&explicit, limits), 8192);
+    }
+
+    #[test]
     fn maximum_legal_escaped_search_response_fits_consumer_allowance() {
         let mut remaining = 65535;
         let mut items = Vec::new();
@@ -3213,6 +3306,7 @@ mod search_limit_contract_tests {
             context_bytes: 65535,
             truncated: true,
             warnings: vec!["lexical_ready", "semantic_ready", "no_matches"],
+            context: None,
         };
         let bytes = serde_json::to_vec(&response).unwrap();
         assert!(bytes.len() > 393_210);

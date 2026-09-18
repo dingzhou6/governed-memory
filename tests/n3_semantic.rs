@@ -1593,6 +1593,1741 @@ async fn readiness_uses_only_applicable_current_evidence() {
     assert_eq!(customer_b.1["warnings"][1], "extraction_not_ready");
 }
 
+async fn seed_extracted_passages(
+    db: &PgPool,
+    item: &str,
+    source: &str,
+    set: &str,
+    passage_ids: &[&str],
+    texts: &[&str],
+) {
+    let revision = format!("{item}-r1");
+    sqlx::query(
+        "INSERT INTO items (tenant_id,id,collection_id,active_revision_id) VALUES ($1,$2,$3,NULL)",
+    )
+    .bind(TENANT)
+    .bind(item)
+    .bind(PRIVATE_COLLECTION)
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO revisions (tenant_id,item_id,id,content) VALUES ($1,$2,$3,'document shell')",
+    )
+    .bind(TENANT)
+    .bind(item)
+    .bind(&revision)
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE items SET active_revision_id=$3 WHERE tenant_id=$1 AND id=$2")
+        .bind(TENANT)
+        .bind(item)
+        .bind(&revision)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO source_revisions (tenant_id,item_id,revision_id,id,source_sha256) VALUES ($1,$2,$3,$4,digest($4,'sha256'))",
+    )
+    .bind(TENANT)
+    .bind(item)
+    .bind(&revision)
+    .bind(source)
+    .execute(db)
+    .await
+    .unwrap();
+    let parents = vec!["root"; passage_ids.len()];
+    let directions = vec!["none"; passage_ids.len()];
+    let locators = (1..=passage_ids.len())
+        .map(|page| format!("{{\"page\":{page}}}"))
+        .collect::<Vec<_>>();
+    sqlx::query(
+        "SELECT activate_document_extraction($1,$2,$3,$4,digest($4,'sha256'),$5,'fixture-parser','v1','cfg',$6,$7,$8,$9,$10)",
+    )
+    .bind(TENANT)
+    .bind(item)
+    .bind(&revision)
+    .bind(source)
+    .bind(set)
+    .bind(passage_ids)
+    .bind(&parents)
+    .bind(&directions)
+    .bind(&locators)
+    .bind(texts)
+    .fetch_one(db)
+    .await
+    .unwrap();
+}
+
+fn offset_query_vector(query_vector: &str, offset: u16) -> String {
+    let parts = query_vector
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .enumerate()
+        .map(|(i, part)| {
+            let value: i32 = part.parse().expect("query vector component");
+            if i == 2 {
+                (value + i32::from(offset) + 1).to_string()
+            } else {
+                value.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", parts.join(","))
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_source_block_packs_in_window_same_source_span() {
+    // en09-p01 shape: first-appearance decoy occupies a rank-first slot; the later
+    // same-source span stays in fused 41 but sits after 12/4/2160 item cap unless
+    // hybrid emits that source's window rows together.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_sblock",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_sblock_anchor",
+        "n3_sblock_anchor_source",
+        "n3_sblock_anchor_set",
+        &["srcblock-decoy", "srcblock-needed"],
+        &[
+            "The briefing overlap notes are ready for the anchor.",
+            "The later method span belongs to the same briefing source.",
+        ],
+    )
+    .await;
+    for index in 0..12 {
+        let item = format!("n3_sblock_f{index:02}");
+        let source = format!("n3_sblock_f{index:02}_source");
+        let set = format!("n3_sblock_f{index:02}_set");
+        let passage = format!("sblock-f{index:02}");
+        let text = format!("The briefing overlap notes are ready for filler {index:02}.");
+        seed_extracted_passages(&db, &item, &source, &set, &[&passage], &[text.as_str()]).await;
+    }
+    let query = "The briefing overlap notes are ready.";
+    let query_vector = deterministic_vector(query);
+    let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+        .fetch_all(&worker)
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 14);
+    for job in &jobs {
+        let passage = job.get::<String, _>("passage_id");
+        let vector = if passage == "srcblock-needed" {
+            "[999,999,999]".to_owned()
+        } else if passage == "srcblock-decoy" {
+            query_vector.clone()
+        } else {
+            let offset: u16 = passage
+                .rsplit_once('f')
+                .and_then(|(_, rest)| rest.parse().ok())
+                .unwrap_or(1);
+            offset_query_vector(&query_vector, offset)
+        };
+        assert_eq!(complete(&worker, job, &vector).await, "complete");
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000201")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_sblock")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    assert!(
+        fused_ids.iter().any(|id| id == "srcblock-decoy"),
+        "first-appearance decoy must already be in the fused 41: {fused_ids:?}"
+    );
+    assert!(
+        fused_ids.iter().any(|id| id == "srcblock-needed"),
+        "needed ID must already be in the fused 41: {fused_ids:?}"
+    );
+
+    let input = serde_json::json!({
+        "query":query,
+        "semantic":true,
+        "max_context_bytes":16384,
+        "context_token_budget":{
+            "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+            "max_tokens":2160
+        }
+    });
+    let response = router(runtime)
+        .oneshot(
+            Request::post("/v1/search")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let packed = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["citation"]["passage_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        packed.len() <= 12,
+        "native item guard stays 12, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "srcblock-decoy"),
+        "first-appearance decoy must pack under 12/4/2160, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "srcblock-needed"),
+        "srcblock-needed is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_lexical_head_packs_later_source_in_window() {
+    // en-q1 shape after 0010: three earlier sources dump 4 rows each and fill 12/4/2160;
+    // lhead-needed stays in fused 41 (source_first is not 1) with lexical_rank<=4.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_lhead",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    for dump in 0..3 {
+        let item = format!("n3_lhead_d{dump}");
+        let source = format!("n3_lhead_d{dump}_source");
+        let set = format!("n3_lhead_d{dump}_set");
+        let ids = [
+            format!("lhead-d{dump}-p0"),
+            format!("lhead-d{dump}-p1"),
+            format!("lhead-d{dump}-p2"),
+            format!("lhead-d{dump}-p3"),
+        ];
+        let texts = [
+            format!("The briefing overlap notes are ready for dump {dump}."),
+            format!("Unrelated semantic neighbor filler {dump} one."),
+            format!("Unrelated semantic neighbor filler {dump} two."),
+            format!("Unrelated semantic neighbor filler {dump} three."),
+        ];
+        seed_extracted_passages(
+            &db,
+            &item,
+            &source,
+            &set,
+            &[
+                ids[0].as_str(),
+                ids[1].as_str(),
+                ids[2].as_str(),
+                ids[3].as_str(),
+            ],
+            &[
+                texts[0].as_str(),
+                texts[1].as_str(),
+                texts[2].as_str(),
+                texts[3].as_str(),
+            ],
+        )
+        .await;
+    }
+    seed_extracted_passages(
+        &db,
+        "n3_lhead_need",
+        "n3_lhead_need_source",
+        "n3_lhead_need_set",
+        &["lhead-needed"],
+        &["The quenched vanadium serial method span belongs to the later source."],
+    )
+    .await;
+    let query = "The briefing overlap notes are ready. Quenched vanadium serial.";
+    let query_vector = deterministic_vector(query);
+    let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+        .fetch_all(&worker)
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 13);
+    for job in &jobs {
+        let passage = job.get::<String, _>("passage_id");
+        let vector = if passage == "lhead-needed" {
+            "[999,999,999]".to_owned()
+        } else if let Some((dump, slot)) = passage.strip_prefix("lhead-d").and_then(|rest| {
+            let (dump, slot) = rest.split_once("-p")?;
+            Some((dump.parse::<u16>().ok()?, slot.parse::<u16>().ok()?))
+        }) {
+            offset_query_vector(&query_vector, dump * 4 + slot)
+        } else {
+            offset_query_vector(&query_vector, 20)
+        };
+        assert_eq!(complete(&worker, job, &vector).await, "complete");
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000202")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_lhead")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    assert!(
+        fused_ids.iter().any(|id| id == "lhead-needed"),
+        "needed ID must already be in the fused 41: {fused_ids:?}"
+    );
+
+    let input = serde_json::json!({
+        "query":query,
+        "semantic":true,
+        "max_context_bytes":16384,
+        "context_token_budget":{
+            "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+            "max_tokens":2160
+        }
+    });
+    let response = router(runtime)
+        .oneshot(
+            Request::post("/v1/search")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let packed = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["citation"]["passage_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        packed.len() <= 12,
+        "native item guard stays 12, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "lhead-needed"),
+        "lhead-needed is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160"
+    );
+}
+
+fn pad_span(text: &str, bytes: usize) -> String {
+    let mut span = text.to_string();
+    while span.len() < bytes {
+        span.push_str(" Station path distance reference access note.");
+    }
+    span.truncate(bytes);
+    while !span.is_char_boundary(span.len()) {
+        span.pop();
+    }
+    span
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_lex_head_defers_huge_same_clause_decoy() {
+    // en-q1 after 0011: a huge same-clause lex-head (en05-p01 shape) still fits
+    // 2160 and token-stops before the rest of an in-window complete basis.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_sdefer",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    for dump in 0..2 {
+        let item = format!("n3_sdefer_d{dump}");
+        let source = format!("n3_sdefer_d{dump}_source");
+        let set = format!("n3_sdefer_d{dump}_set");
+        let ids = [
+            format!("sdefer-d{dump}-p0"),
+            format!("sdefer-d{dump}-p1"),
+            format!("sdefer-d{dump}-p2"),
+            format!("sdefer-d{dump}-p3"),
+        ];
+        let texts = [
+            pad_span(
+                &format!("The briefing overlap notes are ready for dump {dump}."),
+                520,
+            ),
+            pad_span(
+                &format!("Unrelated semantic neighbor filler {dump} one."),
+                520,
+            ),
+            pad_span(
+                &format!("Unrelated semantic neighbor filler {dump} two."),
+                520,
+            ),
+            pad_span(
+                &format!("Unrelated semantic neighbor filler {dump} three."),
+                520,
+            ),
+        ];
+        seed_extracted_passages(
+            &db,
+            &item,
+            &source,
+            &set,
+            &[
+                ids[0].as_str(),
+                ids[1].as_str(),
+                ids[2].as_str(),
+                ids[3].as_str(),
+            ],
+            &[
+                texts[0].as_str(),
+                texts[1].as_str(),
+                texts[2].as_str(),
+                texts[3].as_str(),
+            ],
+        )
+        .await;
+    }
+    let huge = pad_span(
+        "The briefing overlap notes are ready. Shoreline register. ",
+        4356,
+    );
+    seed_extracted_passages(
+        &db,
+        "n3_sdefer_huge",
+        "n3_sdefer_huge_source",
+        "n3_sdefer_huge_set",
+        &["sdefer-huge"],
+        &[huge.as_str()],
+    )
+    .await;
+    let needed_head = pad_span(
+        "The quenched vanadium serial method span belongs to the later source.",
+        520,
+    );
+    let needed_tail = pad_span(
+        "The later method span belongs to the same later source.",
+        520,
+    );
+    seed_extracted_passages(
+        &db,
+        "n3_sdefer_need",
+        "n3_sdefer_need_source",
+        "n3_sdefer_need_set",
+        &["sdefer-needed-head", "sdefer-needed-tail"],
+        &[needed_head.as_str(), needed_tail.as_str()],
+    )
+    .await;
+    let query = "The briefing overlap notes are ready. Quenched vanadium serial.";
+    let query_vector = deterministic_vector(query);
+    let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+        .fetch_all(&worker)
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 11);
+    for job in &jobs {
+        let passage = job.get::<String, _>("passage_id");
+        let vector = if passage == "sdefer-needed-head" {
+            "[999,999,999]".to_owned()
+        } else if passage == "sdefer-needed-tail" {
+            offset_query_vector(&query_vector, 1)
+        } else if passage == "sdefer-huge" {
+            query_vector.clone()
+        } else if let Some((dump, slot)) = passage.strip_prefix("sdefer-d").and_then(|rest| {
+            let (dump, slot) = rest.split_once("-p")?;
+            Some((dump.parse::<u16>().ok()?, slot.parse::<u16>().ok()?))
+        }) {
+            offset_query_vector(&query_vector, 4 + dump * 4 + slot)
+        } else {
+            offset_query_vector(&query_vector, 30)
+        };
+        assert_eq!(complete(&worker, job, &vector).await, "complete");
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000203")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_sdefer")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    assert!(
+        fused_ids.iter().any(|id| id == "sdefer-huge"),
+        "huge same-clause decoy must already be in the fused 41: {fused_ids:?}"
+    );
+    assert!(
+        fused_ids.iter().any(|id| id == "sdefer-needed-head"),
+        "needed head must already be in the fused 41: {fused_ids:?}"
+    );
+    assert!(
+        fused_ids.iter().any(|id| id == "sdefer-needed-tail"),
+        "needed tail must already be in the fused 41: {fused_ids:?}"
+    );
+
+    let input = serde_json::json!({
+        "query":query,
+        "semantic":true,
+        "max_context_bytes":16384,
+        "context_token_budget":{
+            "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+            "max_tokens":2160
+        }
+    });
+    let response = router(runtime)
+        .oneshot(
+            Request::post("/v1/search")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let packed = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["citation"]["passage_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        packed.len() <= 12,
+        "native item guard stays 12, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "sdefer-needed-head"),
+        "lex-head must still pack the later-source head, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "sdefer-needed-tail"),
+        "sdefer-needed-tail is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160 after a huge same-clause lex-head decoy"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_headed_lex_neighbor_packs_in_window_extra() {
+    // zh-q3 shape after 0012: k=4 heads pack, then earlier dump sources fill 12/4/2160
+    // before the headed source's still-lexical extra (zh10-p01, lex 11). Funès-style
+    // one extra of a headed source with lexical_rank<=16 must pack without raising
+    // 2160 or the 12/4 caps.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_hneigh",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    for dump in 0..3 {
+        let item = format!("n3_hneigh_d{dump}");
+        let source = format!("n3_hneigh_d{dump}_source");
+        let set = format!("n3_hneigh_d{dump}_set");
+        let ids = [
+            format!("hneigh-d{dump}-p0"),
+            format!("hneigh-d{dump}-p1"),
+            format!("hneigh-d{dump}-p2"),
+            format!("hneigh-d{dump}-p3"),
+        ];
+        let texts = [
+            format!("The briefing overlap notes are ready for dump {dump}."),
+            format!("Unrelated semantic neighbor filler {dump} one."),
+            format!("Unrelated semantic neighbor filler {dump} two."),
+            format!("Unrelated semantic neighbor filler {dump} three."),
+        ];
+        seed_extracted_passages(
+            &db,
+            &item,
+            &source,
+            &set,
+            &[
+                ids[0].as_str(),
+                ids[1].as_str(),
+                ids[2].as_str(),
+                ids[3].as_str(),
+            ],
+            &[
+                texts[0].as_str(),
+                texts[1].as_str(),
+                texts[2].as_str(),
+                texts[3].as_str(),
+            ],
+        )
+        .await;
+    }
+    seed_extracted_passages(
+        &db,
+        "n3_hneigh_need",
+        "n3_hneigh_need_source",
+        "n3_hneigh_need_set",
+        &["hneigh-needed-head", "hneigh-needed-extra"],
+        &[
+            "The quenched vanadium serial method span belongs to the later source.",
+            "The quenched vanadium serial extra span belongs to the same headed source.",
+        ],
+    )
+    .await;
+    let query = "The briefing overlap notes are ready. Quenched vanadium serial.";
+    let query_vector = deterministic_vector(query);
+    loop {
+        let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+            .fetch_all(&worker)
+            .await
+            .unwrap();
+        if jobs.is_empty() {
+            break;
+        }
+        for job in &jobs {
+            let passage = job.get::<String, _>("passage_id");
+            let vector = if passage == "hneigh-needed-head" {
+                "[999,999,999]".to_owned()
+            } else if passage == "hneigh-needed-extra" {
+                "[998,998,998]".to_owned()
+            } else if let Some((dump, slot)) = passage.strip_prefix("hneigh-d").and_then(|rest| {
+                let (dump, slot) = rest.split_once("-p")?;
+                Some((dump.parse::<u16>().ok()?, slot.parse::<u16>().ok()?))
+            }) {
+                offset_query_vector(&query_vector, dump * 4 + slot)
+            } else {
+                offset_query_vector(&query_vector, 20)
+            };
+            assert_eq!(complete(&worker, job, &vector).await, "complete");
+        }
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000205")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_hneigh")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    assert!(
+        fused_ids.iter().any(|id| id == "hneigh-needed-head"),
+        "needed head must already be in the fused 41: {fused_ids:?}"
+    );
+    assert!(
+        fused_ids.iter().any(|id| id == "hneigh-needed-extra"),
+        "needed extra must already be in the fused 41: {fused_ids:?}"
+    );
+
+    let input = serde_json::json!({
+        "query":query,
+        "semantic":true,
+        "max_context_bytes":16384,
+        "context_token_budget":{
+            "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+            "max_tokens":2160
+        }
+    });
+    let response = router(runtime)
+        .oneshot(
+            Request::post("/v1/search")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let packed = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["citation"]["passage_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        packed.len() <= 12,
+        "native item guard stays 12, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "hneigh-needed-head"),
+        "lex-head must still pack the headed source, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "hneigh-needed-extra"),
+        "hneigh-needed-extra is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_headed_extra_seq3_defers_behind_unheaded() {
+    // zh-q3 after 0014: k=4 heads and the lex<=16 neighbor pack, extra_seq=2
+    // stays, but extra_seq>=3 of that headed source (zh07-p00) still emits in
+    // the remainder source-block and fills 12/4/2160 before unheaded zh08-p01.
+    // Defer extra_seq>=3 only after a real neighbor; keep the 0011 singleton
+    // lex head. Skip-singleton remains rejected.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_htail",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_htail_d0",
+        "n3_htail_d0_source",
+        "n3_htail_d0_set",
+        &["htail-d0-p0", "htail-d0-p1", "htail-d0-p2", "htail-d0-p3"],
+        &[
+            "The briefing overlap notes are ready for dump 0.",
+            "Unrelated semantic neighbor filler 0 one.",
+            "Unrelated semantic neighbor filler 0 two.",
+            "Unrelated semantic neighbor filler 0 three.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_htail_d1",
+        "n3_htail_d1_source",
+        "n3_htail_d1_set",
+        &["htail-d1-p0", "htail-d1-p1", "htail-d1-p2"],
+        &[
+            "The briefing overlap notes are ready for dump 1.",
+            "Unrelated semantic neighbor filler 1 one.",
+            "Unrelated semantic neighbor filler 1 two.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_htail_d2",
+        "n3_htail_d2_source",
+        "n3_htail_d2_set",
+        &["htail-d2-p0"],
+        &["The briefing overlap notes are ready for dump 2."],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_htail_need",
+        "n3_htail_need_source",
+        "n3_htail_need_set",
+        &[
+            "htail-needed-head",
+            "htail-needed-extra",
+            "htail-needed-left",
+            "htail-needed-stub",
+        ],
+        &[
+            "The quenched vanadium serial method span belongs to the later source.",
+            "The quenched vanadium serial extra span belongs to the same headed source.",
+            "The quenched vanadium serial leftover span belongs to the same headed source.",
+            "Short headed stub.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_htail_gold",
+        "n3_htail_gold_source",
+        "n3_htail_gold_set",
+        &["htail-unheaded-gold"],
+        &["Unheaded shoreline register gold span."],
+    )
+    .await;
+    let query = "The briefing overlap notes are ready. Quenched vanadium serial.";
+    let query_vector = deterministic_vector(query);
+    loop {
+        let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+            .fetch_all(&worker)
+            .await
+            .unwrap();
+        if jobs.is_empty() {
+            break;
+        }
+        for job in &jobs {
+            let passage = job.get::<String, _>("passage_id");
+            let vector = if passage == "htail-needed-head" {
+                "[999,999,999]".to_owned()
+            } else if passage == "htail-needed-extra" {
+                "[998,998,998]".to_owned()
+            } else if passage == "htail-needed-left" {
+                "[997,997,997]".to_owned()
+            } else if passage == "htail-needed-stub" {
+                "[996,996,996]".to_owned()
+            } else if passage == "htail-unheaded-gold" {
+                "[999,999,999]".to_owned()
+            } else if let Some((dump, slot)) = passage.strip_prefix("htail-d").and_then(|rest| {
+                let (dump, slot) = rest.split_once("-p")?;
+                Some((dump.parse::<u16>().ok()?, slot.parse::<u16>().ok()?))
+            }) {
+                offset_query_vector(&query_vector, dump * 4 + slot)
+            } else {
+                offset_query_vector(&query_vector, 20)
+            };
+            assert_eq!(complete(&worker, job, &vector).await, "complete");
+        }
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000206")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_htail")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    for id in [
+        "htail-needed-head",
+        "htail-needed-extra",
+        "htail-needed-left",
+        "htail-needed-stub",
+        "htail-unheaded-gold",
+        "htail-d2-p0",
+    ] {
+        assert!(
+            fused_ids.iter().any(|got| got == id),
+            "{id} must already be in the fused 41: {fused_ids:?}"
+        );
+    }
+
+    let input = serde_json::json!({
+        "query":query,
+        "semantic":true,
+        "max_context_bytes":16384,
+        "context_token_budget":{
+            "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+            "max_tokens":2160
+        }
+    });
+    let response = router(runtime)
+        .oneshot(
+            Request::post("/v1/search")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let packed = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["citation"]["passage_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        packed.len() <= 12,
+        "native item guard stays 12, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "htail-needed-head"),
+        "lex-head must still pack the headed source, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "htail-d2-p0"),
+        "0011 singleton lex head must stay packed, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "htail-needed-extra"),
+        "lex<=16 neighbor must still pack, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "htail-needed-left"),
+        "extra_seq=2 leftover must stay in the remainder, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "htail-unheaded-gold"),
+        "htail-unheaded-gold is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160 because extra_seq>=3 of a neighbored source was not deferred"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_rarest_han_content_gram_admits_sem_tail_without_raising_han_k() {
+    // zh-q2 shape: gold is semantic-only at the fused tail (direct 53 analog) because
+    // Han local k=4 (and k=8) is flooded by common grams. The name bigram DF is 3.
+    // Raising Han k globally would add more lex-only decoys and eject the edge
+    // semantic-only required ID; this contract must not pass by that change.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_rhcg",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_rhcg_head",
+        "n3_rhcg_head_source",
+        "n3_rhcg_head_set",
+        &["rhcg-head"],
+        &["裴宁完成备用字幕操作培训。"],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_rhcg_mid",
+        "n3_rhcg_mid_source",
+        "n3_rhcg_mid_set",
+        &["rhcg-mid"],
+        &["裴宁已有整场审核记录。"],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_rhcg_need",
+        "n3_rhcg_need_source",
+        "n3_rhcg_need_set",
+        &["rhcg-needed"],
+        &["裴宁用主文件完成实际屏幕显示检查。"],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_rhcg_edge",
+        "n3_rhcg_edge_source",
+        "n3_rhcg_edge_set",
+        &["rhcg-edge"],
+        &["The later method span belongs to the edge source."],
+    )
+    .await;
+    for index in 0..12 {
+        let item = format!("n3_rhcg_d{index:02}");
+        let source = format!("n3_rhcg_d{index:02}_source");
+        let set = format!("n3_rhcg_d{index:02}_set");
+        let passage = format!("rhcg-d{index:02}");
+        let text = format!("演出当天不能到场的候补屏幕记录{index:02}。");
+        seed_extracted_passages(&db, &item, &source, &set, &[&passage], &[text.as_str()]).await;
+    }
+    for index in 0..2 {
+        let item = format!("n3_rhcg_if{index}");
+        let source = format!("n3_rhcg_if{index}_source");
+        let set = format!("n3_rhcg_if{index}_set");
+        let passage = format!("rhcg-if{index}");
+        seed_extracted_passages(
+            &db,
+            &item,
+            &source,
+            &set,
+            &[&passage],
+            &["如果候补说明写在别册。"],
+        )
+        .await;
+    }
+    let mut filler_ids = Vec::new();
+    let mut filler_texts = Vec::new();
+    for index in 0..37 {
+        filler_ids.push(format!("rhcg-f{index:02}"));
+        filler_texts.push(format!(
+            "The briefing overlap notes are ready for filler {index:02}."
+        ));
+    }
+    let filler_id_refs = filler_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let filler_text_refs = filler_texts.iter().map(String::as_str).collect::<Vec<_>>();
+    seed_extracted_passages(
+        &db,
+        "n3_rhcg_fill",
+        "n3_rhcg_fill_source",
+        "n3_rhcg_fill_set",
+        &filler_id_refs,
+        &filler_text_refs,
+    )
+    .await;
+
+    let query = "如果演出当天裴宁不能到场。";
+    let han_k: Option<i32> =
+        sqlx::query_scalar("SELECT local_k FROM lexical_clause_queries_v1($1) LIMIT 1")
+            .bind(query)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(han_k, Some(4), "Han local_k stays 4");
+    let single_bound: String =
+        sqlx::query_scalar("SELECT preparation_status FROM lexical_clause_queries_v1($1)")
+            .bind("lexical beacon")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(single_bound, "single_bound");
+
+    let query_vector = deterministic_vector(query);
+    loop {
+        let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+            .fetch_all(&worker)
+            .await
+            .unwrap();
+        if jobs.is_empty() {
+            break;
+        }
+        for job in &jobs {
+            let passage = job.get::<String, _>("passage_id");
+            let vector = if passage == "rhcg-head" {
+                offset_query_vector(&query_vector, 1)
+            } else if passage == "rhcg-mid" {
+                offset_query_vector(&query_vector, 2)
+            } else if passage == "rhcg-edge" {
+                offset_query_vector(&query_vector, 36)
+            } else if passage == "rhcg-needed" {
+                offset_query_vector(&query_vector, 41)
+            } else if let Some(rest) = passage.strip_prefix("rhcg-f") {
+                let index: u16 = rest.parse().unwrap();
+                let offset = if index < 33 {
+                    3 + index
+                } else {
+                    37 + (index - 33)
+                };
+                offset_query_vector(&query_vector, offset)
+            } else {
+                offset_query_vector(&query_vector, 200)
+            };
+            assert_eq!(complete(&worker, job, &vector).await, "complete");
+        }
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000204")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_rhcg")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    assert!(
+        fused_ids.iter().any(|id| id == "rhcg-needed"),
+        "rarest DF>=3 Han content gram must admit rhcg-needed into fused 41 without raising Han k: {fused_ids:?}"
+    );
+    assert!(
+        fused_ids.iter().any(|id| id == "rhcg-edge"),
+        "edge semantic-only required ID must stay in fused 41 (Han k=8 crowding would eject it): {fused_ids:?}"
+    );
+    assert!(
+        fused_ids.iter().any(|id| id == "rhcg-head"),
+        "name posting already in-window must stay: {fused_ids:?}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_han_two_head_dump_rr_packs_late_unheaded() {
+    // zh-q1 after 0015: a two-head dump keeps extras in the remainder; an early
+    // unheaded source-block then fills 12/4/2160 before a later required
+    // unheaded row. Han-only: defer two-head extras and extra_seq>=2 without a
+    // neighbor, then unheaded extra_seq=1 round-robin. English queries stay 0015.
+    // Han local_k stays 4.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_h2rr",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_h2rr_d0",
+        "n3_h2rr_d0_source",
+        "n3_h2rr_d0_set",
+        &["h2rr-d0-p0", "h2rr-d0-p1", "h2rr-d0-p2", "h2rr-d0-p3"],
+        &[
+            "The briefing overlap notes are ready for dump 0 head a.",
+            "The briefing overlap notes are ready for dump 0 head b.",
+            "Unrelated semantic neighbor filler 0 two.",
+            "Unrelated semantic neighbor filler 0 three.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_h2rr_d1",
+        "n3_h2rr_d1_source",
+        "n3_h2rr_d1_set",
+        &["h2rr-d1-p0", "h2rr-d1-p1", "h2rr-d1-p2"],
+        &[
+            "The briefing overlap notes are ready for dump 1.",
+            "Unrelated semantic neighbor filler 1 one.",
+            "Unrelated semantic neighbor filler 1 two.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_h2rr_d2",
+        "n3_h2rr_d2_source",
+        "n3_h2rr_d2_set",
+        &["h2rr-d2-p0"],
+        &["The briefing overlap notes are ready for dump 2."],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_h2rr_early",
+        "n3_h2rr_early_source",
+        "n3_h2rr_early_set",
+        &[
+            "h2rr-early-p0",
+            "h2rr-early-p1",
+            "h2rr-early-p2",
+            "h2rr-early-p3",
+        ],
+        &[
+            "Unrelated semantic neighbor filler early one.",
+            "Unrelated semantic neighbor filler early two.",
+            "Unrelated semantic neighbor filler early three.",
+            "Unrelated semantic neighbor filler early four.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_h2rr_goldb",
+        "n3_h2rr_goldb_source",
+        "n3_h2rr_goldb_set",
+        &["h2rr-late-goldb"],
+        &["巡演简报已就绪 Unheaded shoreline register gold span."],
+    )
+    .await;
+    let query = "巡演简报已就绪. The briefing overlap notes are ready.";
+    let han_k: Option<i32> =
+        sqlx::query_scalar("SELECT local_k FROM lexical_clause_queries_v1($1) LIMIT 1")
+            .bind(query)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(han_k, Some(4), "Han local_k stays 4");
+    let query_vector = deterministic_vector(query);
+    loop {
+        let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+            .fetch_all(&worker)
+            .await
+            .unwrap();
+        if jobs.is_empty() {
+            break;
+        }
+        for job in &jobs {
+            let passage = job.get::<String, _>("passage_id");
+            let vector = if passage == "h2rr-late-goldb" {
+                "[900,900,900]".to_owned()
+            } else if let Some(rest) = passage.strip_prefix("h2rr-d") {
+                if let Some((dump, slot)) = rest.split_once("-p") {
+                    let dump = dump.parse::<u16>().unwrap_or(0);
+                    let slot = slot.parse::<u16>().unwrap_or(0);
+                    offset_query_vector(&query_vector, dump * 4 + slot)
+                } else {
+                    offset_query_vector(&query_vector, 20)
+                }
+            } else if let Some(slot) = passage.strip_prefix("h2rr-early-p") {
+                let slot = slot.parse::<u16>().unwrap_or(0);
+                offset_query_vector(&query_vector, 40 + slot)
+            } else {
+                offset_query_vector(&query_vector, 20)
+            };
+            assert_eq!(complete(&worker, job, &vector).await, "complete");
+        }
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000207")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_h2rr")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    for id in ["h2rr-d0-p0", "h2rr-d0-p1", "h2rr-d2-p0", "h2rr-late-goldb"] {
+        assert!(
+            fused_ids.iter().any(|got| got == id),
+            "{id} must already be in the fused 41: {fused_ids:?}"
+        );
+    }
+
+    let input = serde_json::json!({
+        "query":query,
+        "semantic":true,
+        "max_context_bytes":16384,
+        "context_token_budget":{
+            "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+            "max_tokens":2160
+        }
+    });
+    let response = router(runtime)
+        .oneshot(
+            Request::post("/v1/search")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let packed = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["citation"]["passage_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        packed.len() <= 12,
+        "native item guard stays 12, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "h2rr-d2-p0"),
+        "0011 singleton lex head must stay packed, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "h2rr-late-goldb"),
+        "h2rr-late-goldb is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160 because two-head dump extras and early unheaded source-block were not yielded"
+    );
+    let pos = |id: &str| packed.iter().position(|got| got == id);
+    assert!(
+        pos("h2rr-late-goldb").unwrap() < pos("h2rr-d0-p2").unwrap_or(packed.len()),
+        "two-head dump extras must wait behind the late unheaded gold, packed {packed:?}"
+    );
+    assert!(
+        pos("h2rr-d1-p2").is_none() || pos("h2rr-late-goldb").unwrap() < pos("h2rr-d1-p2").unwrap(),
+        "extra_seq>=2 of a one-head Han dump without a neighbor must wait behind gold, packed {packed:?}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_han_unheaded_adj_packs_next_passage() {
+    // zh-q1 after 0016: unheaded extra_seq=1 of a late source is p00 (lex-only);
+    // extra_seq=2 is p04; gold p01 is extra_seq=3. Dual-weak extra_seq=1 rows
+    // fill 12/4/2160. Han-only: keep lex-only firsts (sem<=10 OR lex<=6 OR
+    // lex-only lex<=16) and emit p00's next passage beside it. English stays
+    // 0015/0016. Han local_k stays 4. Singleton k=4 heads stay.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_huan",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_huan_d0",
+        "n3_huan_d0_source",
+        "n3_huan_d0_set",
+        &["huan-d0-p0", "huan-d0-p1", "huan-d0-p2", "huan-d0-p3"],
+        &[
+            "The briefing overlap notes are ready for dump 0 head a.",
+            "The briefing overlap notes are ready for dump 0 head b.",
+            "Unrelated semantic neighbor filler 0 two.",
+            "Unrelated semantic neighbor filler 0 three.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_huan_d1",
+        "n3_huan_d1_source",
+        "n3_huan_d1_set",
+        &["huan-d1-p0", "huan-d1-p1", "huan-d1-p2"],
+        &[
+            "The briefing overlap notes are ready for dump 1.",
+            "Unrelated semantic neighbor filler 1 one.",
+            "Unrelated semantic neighbor filler 1 two.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_huan_d2",
+        "n3_huan_d2_source",
+        "n3_huan_d2_set",
+        &["huan-d2-p0"],
+        &["The briefing overlap notes are ready for dump 2."],
+    )
+    .await;
+    for index in 0..8 {
+        let item = format!("n3_huan_w{index}");
+        let source = format!("n3_huan_w{index}_source");
+        let set = format!("n3_huan_w{index}_set");
+        let passage = format!("huan-w{index}-p00");
+        let text = format!("Unrelated semantic neighbor filler wait {index} span.");
+        seed_extracted_passages(&db, &item, &source, &set, &[&passage], &[text.as_str()]).await;
+    }
+    seed_extracted_passages(
+        &db,
+        "n3_huan_gold",
+        "n3_huan_gold_source",
+        "n3_huan_gold_set",
+        &["huan-late-p00", "huan-late-p04", "huan-late-p01"],
+        &[
+            "巡演简报已就绪 late first span.",
+            "Unrelated semantic neighbor filler late four.",
+            "巡演简报已就绪 late adjacent gold span.",
+        ],
+    )
+    .await;
+    let query = "巡演简报已就绪. The briefing overlap notes are ready.";
+    let han_k: Option<i32> =
+        sqlx::query_scalar("SELECT local_k FROM lexical_clause_queries_v1($1) LIMIT 1")
+            .bind(query)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(han_k, Some(4), "Han local_k stays 4");
+    let query_vector = deterministic_vector(query);
+    loop {
+        let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+            .fetch_all(&worker)
+            .await
+            .unwrap();
+        if jobs.is_empty() {
+            break;
+        }
+        for job in &jobs {
+            let passage = job.get::<String, _>("passage_id");
+            let vector = if passage == "huan-late-p00" {
+                "[900,900,900]".to_owned()
+            } else if passage == "huan-late-p01" {
+                "[880,880,880]".to_owned()
+            } else if passage == "huan-late-p04" {
+                "[860,860,860]".to_owned()
+            } else if let Some(rest) = passage.strip_prefix("huan-d") {
+                if let Some((dump, slot)) = rest.split_once("-p") {
+                    let dump = dump.parse::<u16>().unwrap_or(0);
+                    let slot = slot.parse::<u16>().unwrap_or(0);
+                    offset_query_vector(&query_vector, dump * 4 + slot)
+                } else {
+                    offset_query_vector(&query_vector, 20)
+                }
+            } else if let Some(rest) = passage.strip_prefix("huan-w") {
+                let index: u16 = rest.split('-').next().unwrap_or("0").parse().unwrap_or(0);
+                offset_query_vector(&query_vector, 12 + index)
+            } else {
+                offset_query_vector(&query_vector, 20)
+            };
+            assert_eq!(complete(&worker, job, &vector).await, "complete");
+        }
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000208")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_huan")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    for id in [
+        "huan-d2-p0",
+        "huan-late-p00",
+        "huan-late-p01",
+        "huan-late-p04",
+    ] {
+        assert!(
+            fused_ids.iter().any(|got| got == id),
+            "{id} must already be in the fused 41: {fused_ids:?}"
+        );
+    }
+
+    let input = serde_json::json!({
+        "query":query,
+        "semantic":true,
+        "max_context_bytes":16384,
+        "context_token_budget":{
+            "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+            "max_tokens":2160
+        }
+    });
+    let response = router(runtime)
+        .oneshot(
+            Request::post("/v1/search")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let packed = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["citation"]["passage_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        packed.len() <= 12,
+        "native item guard stays 12, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "huan-d2-p0"),
+        "0011 singleton lex head must stay packed, packed {packed:?}"
+    );
+    let pos = |id: &str| packed.iter().position(|got| got == id);
+    assert!(
+        packed.iter().any(|id| id == "huan-late-p00"),
+        "lex-only unheaded first p00 must pack, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "huan-late-p01"),
+        "huan-late-p01 is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160 because extra_seq=3 of an unheaded source was not yielded as han_unheaded_adj"
+    );
+    assert!(
+        pos("huan-late-p00").unwrap() < pos("huan-late-p01").unwrap(),
+        "adjacent next passage emits after its first, packed {packed:?}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hybrid_han_deferred_span_packs_skip_passage() {
+    // zh-q2 after 0017: unheaded extra_seq=1 is p00; gold p02/p03 are extra_seq
+    // 2-3 and pass+1 (p01) is absent, so 0017 adj does not fire. Seven first_ok
+    // decoys plus four k=4 heads fill 12 before extra_seq 2-3. Han-only: pair
+    // extra_seq 2-3 of the single best first_ok unheaded source when that
+    // source has no adj. Golds omit the query's Han/English lexemes so they
+    // stay unheaded (Han local_k stays 4). English emit stays 0015/0016/0017.
+    let (db, runtime, worker) = pools().await;
+    select_generation(
+        &db,
+        "deterministic_hspan",
+        "deterministic-fixture-v1",
+        "deterministic-input-v1",
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_hspan_d0",
+        "n3_hspan_d0_source",
+        "n3_hspan_d0_set",
+        &["hspan-d0-p0", "hspan-d0-p1", "hspan-d0-p2", "hspan-d0-p3"],
+        &[
+            "The briefing overlap notes are ready for dump 0 head a.",
+            "The briefing overlap notes are ready for dump 0 head b.",
+            "Unrelated semantic neighbor filler 0 two.",
+            "Unrelated semantic neighbor filler 0 three.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_hspan_d1",
+        "n3_hspan_d1_source",
+        "n3_hspan_d1_set",
+        &["hspan-d1-p0", "hspan-d1-p1", "hspan-d1-p2"],
+        &[
+            "The briefing overlap notes are ready for dump 1.",
+            "Unrelated semantic neighbor filler 1 one.",
+            "Unrelated semantic neighbor filler 1 two.",
+        ],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_hspan_d2",
+        "n3_hspan_d2_source",
+        "n3_hspan_d2_set",
+        &["hspan-d2-p0"],
+        &["The briefing overlap notes are ready for dump 2."],
+    )
+    .await;
+    seed_extracted_passages(
+        &db,
+        "n3_hspan_gold",
+        "n3_hspan_gold_source",
+        "n3_hspan_gold_set",
+        &["hspan-late-p00", "hspan-late-p02", "hspan-late-p03"],
+        &[
+            "Late shoreline register pair first span.",
+            "Late shoreline register pair two span.",
+            "Late shoreline register pair three gold span.",
+        ],
+    )
+    .await;
+    for index in 0..7 {
+        let item = format!("n3_hspan_w{index}");
+        let source = format!("n3_hspan_w{index}_source");
+        let set = format!("n3_hspan_w{index}_set");
+        let passage = format!("hspan-w{index}-p00");
+        let text = format!("Unrelated semantic neighbor filler wait {index} span.");
+        seed_extracted_passages(&db, &item, &source, &set, &[&passage], &[text.as_str()]).await;
+    }
+    let query = "巡演简报已就绪. The briefing overlap notes are ready.";
+    let han_k: Option<i32> =
+        sqlx::query_scalar(
+            "SELECT local_k FROM lexical_clause_queries_v1($1) WHERE local_k IS NOT NULL ORDER BY local_k ASC LIMIT 1",
+        )
+            .bind(query)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(han_k, Some(4), "Han local_k stays 4");
+    let query_vector = deterministic_vector(query);
+    loop {
+        let jobs = sqlx::query("SELECT * FROM claim_embedding_jobs(16,60)")
+            .fetch_all(&worker)
+            .await
+            .unwrap();
+        if jobs.is_empty() {
+            break;
+        }
+        for job in &jobs {
+            let passage = job.get::<String, _>("passage_id");
+            let vector = if passage == "hspan-late-p00" {
+                offset_query_vector(&query_vector, 0)
+            } else if passage == "hspan-late-p02" {
+                offset_query_vector(&query_vector, 1)
+            } else if passage == "hspan-late-p03" {
+                offset_query_vector(&query_vector, 2)
+            } else if let Some(rest) = passage.strip_prefix("hspan-w") {
+                let index: u16 = rest.split('-').next().unwrap_or("0").parse().unwrap_or(0);
+                offset_query_vector(&query_vector, 3 + index)
+            } else {
+                "[20,20,20]".to_owned()
+            };
+            assert_eq!(complete(&worker, job, &vector).await, "complete");
+        }
+    }
+
+    let mut fused_tx = runtime.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.credential_digest',$1,true),set_config('app.operation','search',true),set_config('app.tenant_id',$2,true)")
+        .bind(hex(&Sha256::digest(TOKEN.as_bytes())))
+        .bind(TENANT)
+        .execute(&mut *fused_tx)
+        .await
+        .unwrap();
+    let fused = sqlx::query(
+        "SELECT passage_id FROM search_hybrid_current_memories($1,$2,$3,$4,$5,NULL,$6,$7)",
+    )
+    .bind(TENANT)
+    .bind(READER_ID)
+    .bind("00000000-0000-0000-0000-000000000209")
+    .bind(query)
+    .bind(16_384_i32)
+    .bind("deterministic_hspan")
+    .bind(&query_vector)
+    .fetch_all(&mut *fused_tx)
+    .await
+    .unwrap();
+    fused_tx.commit().await.unwrap();
+    let fused_ids = fused
+        .iter()
+        .map(|row| row.get::<String, _>("passage_id"))
+        .collect::<Vec<_>>();
+    for id in [
+        "hspan-d2-p0",
+        "hspan-late-p00",
+        "hspan-late-p02",
+        "hspan-late-p03",
+    ] {
+        assert!(
+            fused_ids.iter().any(|got| got == id),
+            "{id} must already be in the fused 41: {fused_ids:?}"
+        );
+    }
+
+    let input = serde_json::json!({
+        "query":query,
+        "semantic":true,
+        "max_context_bytes":16384,
+        "context_token_budget":{
+            "tokenizer":"o200k_base:tiktoken-rs-0.12.0",
+            "max_tokens":2160
+        }
+    });
+    let response = router(runtime)
+        .oneshot(
+            Request::post("/v1/search")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(input.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let packed = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["citation"]["passage_id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        packed.len() <= 12,
+        "native item guard stays 12, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "hspan-d2-p0"),
+        "0011 singleton lex head must stay packed, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "hspan-late-p00"),
+        "unheaded first_ok p00 must pack, packed {packed:?}"
+    );
+    assert!(
+        packed.iter().any(|id| id == "hspan-late-p02"),
+        "hspan-late-p02 is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160 because extra_seq=2 of an unheaded first_ok source without adj was not yielded as han_unheaded_pair"
+    );
+    assert!(
+        packed.iter().any(|id| id == "hspan-late-p03"),
+        "hspan-late-p03 is in fused {fused_ids:?} but absent from packed {packed:?} under 12/4/2160 because extra_seq=3 of an unheaded first_ok source without adj was not yielded as han_unheaded_pair"
+    );
+}
+
 #[tokio::test]
 async fn n3_semantic_suite() {
     readiness_uses_only_applicable_current_evidence().await;

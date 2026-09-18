@@ -61,7 +61,7 @@ Hosts must separately enforce intended recipients, external-source permission an
 
 ## Retrieval and remembering
 
-The engine owns bounded candidate selection, lexical/semantic eligibility, evidence packing and lifecycle feedback. The host decides whether to search, directly read known evidence, ask a follow-up or save a proposed memory. Its Context Packet design owns whole-prompt tokens and conversational continuity.
+The engine owns bounded candidate selection, lexical/semantic eligibility, evidence packing and lifecycle feedback. The host decides whether to search, directly read known evidence, ask a follow-up or save a proposed memory. Its Context Packet design owns whole-prompt tokens and conversational continuity. Optional TypeSafe classification or rerank of **already authorized** rows is host work; see the [TypeSafe adaptation plan](typesafe-adaptation-plan.md).
 
 “Saved” means the explicit current revision and lexical representation committed durably; semantic readiness is separate. Corrections require an exact item and expected revision. Forget immediately removes selected memory and derivatives from serving, with physical cleanup and restoration behavior governed separately.
 

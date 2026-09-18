@@ -10,6 +10,12 @@ pub async fn capture<F: Future>(future: F) -> (F::Output, Vec<Value>) {
         })
         .await
 }
+pub(crate) fn capture_sync<R>(run: impl FnOnce() -> R) -> (R, Vec<Value>) {
+    EVENTS.sync_scope(RefCell::new(Vec::new()), || {
+        let result = run();
+        (result, EVENTS.with(RefCell::take))
+    })
+}
 pub(crate) fn enabled() -> bool {
     EVENTS.try_with(|_| ()).is_ok()
 }
@@ -18,6 +24,25 @@ pub(crate) fn record(event: Value) {
 }
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn blocking_capture_returns_only_its_own_events() {
+        let ((), events) = super::capture(async {
+            super::record(serde_json::json!({"stage":"before"}));
+            let ((), nested) = tokio::task::spawn_blocking(|| {
+                super::capture_sync(|| super::record(serde_json::json!({"stage":"blocking"})))
+            })
+            .await
+            .unwrap();
+            for event in nested {
+                super::record(event);
+            }
+        })
+        .await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["stage"], "blocking");
+        assert!(!super::enabled());
+    }
+
     #[tokio::test]
     async fn whole_passage_trace_observes_actual_budget_without_changing_it() {
         let (remaining, events) = super::capture(async {

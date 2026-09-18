@@ -18,7 +18,9 @@ serde_json = { version = "=1.0.151", default-features = false, features = ["arbi
 sha2 = { version = "=0.11.0", default-features = false }
 sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio"] }
 thiserror = { version = "=2.0.20", default-features = false }
-tokio = { version = "=1.53.1", default-features = false, features = ["time"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["time", "rt", "sync"] }
+
+tiktoken-rs = { version = "=0.12.0", default-features = false }
 
 [dev-dependencies]
 calamine = { version = "=0.36.1", default-features = false }
