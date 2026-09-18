@@ -21,3 +21,4 @@
 /justfile.lab
 /tests/benchmarks/office_retrieval.lab.rs
 /tests/benchmarks/jev_shadow_v1.py.lab
+/tests/n4_fixed_long_fresh_wordings_v1.rs
