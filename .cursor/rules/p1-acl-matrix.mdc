@@ -1,8 +1,0 @@
----
-description: P1 ACL/tenant matrix is complete; see P1 ledger. Current work is P2.
-alwaysApply: false
----
-
-# P1 ACL / tenant matrix (complete)
-
-Named HTTP grid + I02 live in `tests/p1_acl_matrix.rs`. Ledger: `docs/architecture/agentic-memory-p1-acl-matrix.md`. Current native slice is **P2** job/authority races.
