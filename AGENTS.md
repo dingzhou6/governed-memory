@@ -11,6 +11,7 @@ If `docs/architecture/agentic-memory-implementation-checklist.md` exists on disk
 - Runtime behavior is in `src/lib.rs`; storage and privilege changes are in `migrations/`; public-operation tests are in `tests/`. `Cargo.toml`, `Cargo.lock`, and `rust-toolchain.toml` define the dependencies and toolchain.
 - Preserve tenant/private isolation, credential-class separation, ACL enforcement, current revision/source/extraction identity, revocation, non-disclosure, transaction atomicity, and sanitized errors/logs. Retrieval relevance and model output cannot grant authority.
 - For native implementation slices, follow the checklist's public-operation failing-test → minimum implementation → passing-test workflow when that checklist is present. A plan or benchmark run alone does not pass a gate.
+- Current native completeness slice is **P2** (job/authority races). Ledger: `docs/architecture/agentic-memory-p2-job-authority-races.md`. P1 HTTP grid: `docs/architecture/agentic-memory-p1-acl-matrix.md`. Do not start P4 production ingest, LoCoMo, Qdrant, or `0019` unless the user asks. Never reset frozen capture ports 55456–55468.
 
 ## Verification and fixture ownership
 
